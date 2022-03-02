@@ -1,0 +1,129 @@
+clear
+close all
+
+% create the object
+photoSim = PhotonStatisticSim
+
+
+% DEFINING THE MODEL
+
+% set up the parameters for a single calculation
+photoSim.nLevels = 5;
+
+% Transition rates (MHz)
+k21 = 50; % radiative emission rate, assumed constant
+k23 = 0.00025; % nonradiative decay rate from (2) to (3) in zero magnetic field
+k24 = k23; % nonradiative decay rate from (2) to (4) in zero magnetic field
+k25 = 4.9995; % nonradiative decay rate from (2) to (5) in zero magnetic field
+k31 = 0.025; % nonradiative relaxation rate from (3) to (1)in zero magnetic field
+k41 = k31; % nonradiative relxation rate from (4) to (1) in zero magnetic field
+k51 = 2.5; % nonradiative relaxation rate from (5) to (1) in zero magnetic field
+
+
+% Ground-state Hamiltonian parameters
+D = 1; % MHz
+E = 0; %MHz
+g = 1; 
+
+
+% Generator matrix
+Gbase = [0 k21 k31 k41 k51;
+     0   0   0  0  0;
+     0   k23 0  0  0;
+     0   k24 0  0  0;
+     0   k25 0  0  0];
+
+
+ 
+% Photon collection matrix: Efficiency for counting photons from each transition  
+% Here, assume photons are collected from (2)-(1) transition only
+C = [0 1 0 0 0;
+     0 0 0 0 0;
+     0 0 0 0 0;
+     0 0 0 0 0;
+     0 0 0 0 0];
+
+
+ 
+
+% SETTING EXPERIMENTAL PARAMETERS
+
+% Optical excitation power
+xSat =[0.5 1 2]; % Ratio k12/k21, where k21 is spontaneous emission rate of (2)
+%xSat = 1;
+% k12 will be calculated from x_sat * k21
+
+% Magnetic field
+Bmag = 0.13; % Magnetic field amplitude (Gauss)
+angles = [0 30 60]; % Magnetic field angles (degrees)
+Bvec = Bmag*[sind(angles)' zeros(size(angles))' cosd(angles)']; % Magnetic field vectors [Bx By Bz]
+
+% Spin operators for S=1
+% Basis is ms = [1,0,-1] for projection along z-direction
+
+Sz = [1 0 0;...
+      0 0 0;...
+      0 0 -1]; % units of hbar
+       
+Sx = [0 1 0;...
+      1 0 1;...
+      0 1 0]./sqrt(2);
+       
+Sy = [0 -1i 0;...
+      1i 0 -1i;...
+      0 1i 0]./sqrt(2);
+       
+
+
+
+
+for i = 1:length(xSat)
+    for b = 1:size(Bvec,1)
+        n = size(Bvec,1)*(i-1)+b; % simulation number
+        G = Gbase;
+        G(2,1) = xSat(i)*k21; % k12 excitation rate
+
+
+        %calculate spin projection for each field
+        h= D*(Sz^2-(2/3)*eye(3)) + E*(Sx^2 - Sy^2)+ g*(Bvec(b,1)*Sx + Bvec(b,2)*Sy + Bvec(b,3)*Sz); % Hamiltonian 
+        [v,d] = eig(h);
+        [GSenergies,ixs] = sort(diag(d));
+        evecs = v(:,ixs);
+        spinProj = [abs(([1,0,-1]/sqrt(2))*evecs).^2; abs(([1,0,+1]/sqrt(2))*evecs).^2;  abs([0 1 0]*evecs).^2;]; % Element (i,j) gives projection of eigenstate j onto index i of (sx, sy, sz)
+        G(3:5,2) = Gbase(3:5,2)'*spinProj; % ES ISC rates: selection rule projections for excited state to triplet inter-system crossing 
+        G(1,3:5) = Gbase(1,3:5)*spinProj; %GS ISC rates: selection rule projections from triplet ISC onto GS
+        
+        photoSim.simParams(n).G = G - diag(sum(G, 1));
+        photoSim.simParams(n).C = C;
+        photoSim.simParams(n).Bvec = Bvec(b,:);
+        photoSim.simParams(n).xSat = xSat(i);
+
+    end
+end
+
+% set what rate the G matrix is defined as
+photoSim.rateUnits = 'MHz';
+
+% define the time axis, scaled acording to the rateUnits for easier viewing
+photoSim.timeUnits = 'ns';
+photoSim.timeScale = 1e3;
+
+% set up some info on what parameter you are sweeping
+photoSim.sweepName = 'B-field angle (deg)';
+photoSim.sweepVar = angles;
+% if simulating multiple powers and fields, set flags to ensure proper plotting
+photoSim.sweepFieldFlag = true; % true if the sweep variable is a function of Bfield, false if not
+photoSim.sweepPowerFlag = false; % true if the sweep variable is a function of power (xSat), false if not
+
+% perform the calculation and plot results
+photoSim.autoPlotResults = true;
+photoSim.simulate_autocorrelation;
+
+% add noise
+timeRange = [0.5, inf]; % this is in the timeUnits defined above
+noiseValue = 0.50; % noise at timeRange(1). It decreases as the 1/sqrt(tau) to agree with experimental data
+
+photoSim.add_non_idealities(timeRange, noiseValue);
+
+
+
