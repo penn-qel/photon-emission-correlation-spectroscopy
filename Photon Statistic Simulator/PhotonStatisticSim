@@ -1,0 +1,552 @@
+classdef PhotonStatisticSim < handle
+    %PhotonStatiscSim is a tool for simulating the photon statistics of a
+    %quantum system by mapping it onto a master equation framework. This
+    %contains a lot of the grunt work for doing the simulations and some
+    %built-in visualization code that almost every use requires.
+    %
+    % author: DAH 11/19/2020. Entirely adapted from Lee's
+    % "simulate_autocorrelation.m" script and accompanying example scripts
+    %----------------------------------------------------------------------
+    
+    % Changeable properties
+    properties
+        % Necessary inputs
+        nLevels; % the number of levels
+        simParams = struct('G', [], ... % nLevels x nLevels matrix giving generator rate matrix
+                            'C', [], ... % nLevels x nLevels matrix giving photon collection
+                            'Bvec', [], ...  % b x 3 matrix giving the magnetic field vectors
+                            'xSat',[]); % Ratio k12/k21, where k21 is spontaneous emission rate of (2)
+%       efficiency for each transition (e.g., this would be a binary matrix
+%       marking the radiative transitions that generate collected photons
+%       assuming collection efficiencies are equal for each transition).
+        timeUnits = 'arb'; % a string defining the time units (use for visualizing)
+        rateUnits = 'arb'; % a string defining the rate units (inverse of time)
+        timeScale = 1; % optionalscaler for converting times to a more useful base-order of magnitude.
+        
+        % Optional inputs
+        t = []; % the time vector to calculate g2 over. Leavingt his empty the program selects a proper range
+        sweepVar; % the variables you are sweeping over (corresponding the length of simParams)
+        sweepName; % the name for the sweepVar to plot
+        sweepFieldFlag; % flag for case where multiple variables are swept to aid in plotting (true if plotting field)
+        sweepPowerFlag; % flag for case where multiple variables are swept to aid in plotting (true if plotting power)
+        
+        % behavior properties
+        calculateG2 = true;
+        autoPlotResults = true;
+        plotDynamics = false;
+        statusBar = false;
+        checkInputs = true;
+        
+    end
+    
+    % output properties dependent on the calculation and can only be
+    % modified from within the class
+    properties (SetAccess = protected)
+        
+        nSimulations; % calculated based on the 3rd dimension size of generator and collection matrices
+        
+        % compile into struct array to be compatible with old framework
+        simResults = struct('steadyStatePopulation', [],...; %steady state level population
+                            'steadyStatePL', [],... % Steady state photon count rate
+                            'eigRates', [], ...% Eigenrates of the generator matrix, sorted in ascending order (real or complex) 
+                            'realRates', [], ...% List of unique real positive rates R giving e^-Rt dynamics 
+                            'imagRates', [], ...% List of unique imaginary rates giving cos(Rt), sin(Rt) dynamics
+                            't', [], ..., % vector of times  for dynamical simulations (in units of 1/G), chosen to span all rates
+                            'p', [], ..., % vector of simulated populations for dynamics following photon collection 
+                            'p_err', [], ..., % difference between final state of simulated dynamics and the steady-state based on null(G): norm(p_final-p_ss)
+                            'g2', []); % photon autocorrelation function g(2)(t) corresponding to vector t        
+        
+        % initialize the struct array for simulating non-idealities
+        noisySimResults = struct('t', [],...
+                                  'g2', [], ...
+                                  'g2Errs', []);
+    end
+    
+    properties (Access = private)
+        % some internal properties to be hidden from user
+        currentSim;
+        
+        % gui handles
+        simNumText;
+        simParamText;
+        simSlider;
+        simAx;
+        simGPlot;
+        simPopPlot;
+        simAutoCorrPlot;
+    end
+    
+    methods
+        function obj = simulate_autocorrelation(obj)
+            % run the simulation, check inputs along the way
+            
+            % check the inputs
+            obj = obj.check_inputs;
+            
+            % prepare plot window
+            if obj.autoPlotResults
+                obj.setup_simulation_figure;
+            end
+            
+            %
+            if obj.statusBar
+                wbh = waitbar(0,['Performing ' num2str(obj.nSimulations) ' simulations...']);
+            end
+            
+            % iterate over the simulations
+            
+            for iSim = 1:obj.nSimulations
+                
+                % reassign to save space
+                G = obj.simParams(iSim).G;
+                C = obj.simParams(iSim).C;
+                
+                % Calculate steady-state populations and PL
+                Gnull = null(G); % Returns null space normalized such that Rnull'*Rnull = 1;
+                if size(Gnull,2)>1
+                    error('The rate matrix has a degenerate null space for simulation no. %d!',pp);
+                end
+                p_ss = (Gnull')/sum(Gnull); % Normalized, steady-state populations, as 1 x nL vector
+                PL_ss = sum((G.*C)*p_ss'); % Sum over radiative channels G_ij*C_ij*p_j
+                obj.simResults(iSim).steadyStatePL = PL_ss;
+                obj.simResults(iSim).steadyStatePopulation = p_ss;
+
+                eigrates = eig(G); % Characteristic rates
+                [allrates,ix] = sort(abs(eigrates)); % sorted positive values
+                minrate = allrates(2); % First rate should be zero (within numeric accuracy), so smallest is second element
+                maxrate = allrates(end);
+                nzrates = eigrates(ix(2:end)); % nonzero eigenrates
+                if any(~isreal(nzrates))
+                    npairs = sum(~isreal(nzrates)); % number of complex conjugate pairs
+                    nunique = length(nzrates)-npairs; % number of unique rates (real or complex conj pairs)
+                    real_rates = NaN(nunique,1);
+                    imag_rates = NaN(nunique,1);
+                    kk=1; % index in nzrates
+                    for ii=1:nunique
+                        if isreal(nzrates(kk))
+                            real_rates(ii) = -nzrates(kk);
+                            imag_rates(ii)=0;
+                            kk=kk+1;
+                        else
+                            if nzrates(kk+1)==conj(nzrates(kk))
+                                real_rates(ii) = -real(nzrates(kk));
+                                imag_rates(ii) = abs(imag(nzrates(kk)));
+                                kk=kk+2; % increment by 2 since recorded both values
+                            else
+                                error('Complex eigenvalue rates found, but not as conjugate pairs!');
+                            end
+                        end
+                    end
+                else
+                    real_rates = -nzrates;
+                    imag_rates = [];
+                end
+                obj.simResults(iSim).eigRates = eigrates(ix); % Sorted in ascending order
+                obj.simResults(iSim).realRates = real_rates; % Real rates giving e^-iRt behavior
+                obj.simResults(iSim).imagRates = imag_rates; % Imaginary rates giving cos(Rt), sin(Rt) behavior
+
+                minpop = min(p_ss(p_ss>eps(max(p_ss)))); % Minimum nonzero population
+                
+                % Create the simulation time span if not provided. other
+                % wise pass on
+                if isempty(obj.t)
+                    tmin = 0.01/maxrate;
+                    tmax = 100/minrate;
+                    nt = 1+ceil(20*log10(tmax/tmin));
+                    tspan = [0,logspace(log10(tmin),log10(tmax),nt)]; % vector of time points spanning all relevant dynamics
+                else
+                    tspan = obj.t;
+                end
+                
+                % Calculate steady-state after emitting a photon
+                % P_ij = C_ij*G_ij is rate of photon detection for transition j->i, given unity population in state j.   
+                % The probability that transition j->i resulted in a photon detection from the steady state configuration is P_ij*pss_j/PL_ss
+                % Hence the probablity of being in state i after detecting a photon is the vector: P*pss/PL_ss.   
+                PhotRateMat = C.*G; % Rates of photon detection
+                p0 = (PhotRateMat*p_ss')./PL_ss; % Probability vector following photon detection: P*pss/PL_ss  
+                if sum(p0) ~= 1 % check that p0 is normalized
+                    warning('Initial state vector is not properly normalized.');
+                end
+
+                ode_opts = odeset('RelTol',1e-3,...
+                    'AbsTol',1e-3*minpop,...
+                    'NonNegative',1:length(p0),...
+                    'Jacobian',G);
+
+                [t_result,p_result] = ode15s(@(t,p) G*p, tspan, p0,ode_opts);
+
+                obj.simResults(iSim).t = t_result;
+                obj.simResults(iSim).p = p_result;
+
+                obj.simResults(iSim).g2 = sum((G.*C)*p_result',1)'./PL_ss;
+
+                obj.simResults(iSim).p_err = norm(p_result(end,:)-p_ss);
+                
+                if obj.autoPlotResults
+                   if obj.nSimulations > 1
+                       obj.simSlider.Value = iSim;
+                       src.Value = iSim;
+                   else
+                       src.Value = 1;                       
+                   end
+                   obj.update_simulation_figure(src, src);
+                   pause(0.05)
+                end
+                   
+                
+                if obj.statusBar
+                    waitbar(pp/nsims,wbh);
+                end
+            
+            end
+            
+            obj.plot_metadata;
+            
+            if obj.statusBar
+                close(wbh)
+            end
+            
+            
+            
+        end
+        
+        function obj = check_inputs(obj)
+            % CHECK_INPUTS verify the input values are consistent and will
+            % produce not throw an error
+            
+            % check input sizes and notify user with error
+            for iSim = 1:length(obj.simParams)
+                generatorSize = size(obj.simParams(iSim).G);
+                collectionSize = size(obj.simParams(iSim).C);
+
+                if ~all(generatorSize == collectionSize)
+                   error(['simParam(%d).G (' num2str(generatorSize), ...
+                       ') simParam(%d).C (' num2str(collectionSize),...
+                       ') are not the same size. '], iSim, iSim)                    
+                end
+            
+                % verify that nLevels agrees with 
+                if ~all(obj.nLevels == generatorSize(1:2))
+                    error('simParams(%d).G size doesn''t equal nLevels ', iSim)
+                elseif ~all(obj.nLevels == collectionSize(1:2))
+                    error('simParams(%d).C size doesn''t equal nLevels', iSim)
+                end
+                
+            end
+            
+            % set the nSimulations now that it has been verified
+            obj.nSimulations = length(obj.simParams);
+            
+        end
+        
+        function obj = setup_simulation_figure(obj)
+            %  setup a figure for visualizing each of the simulations
+            simFig = figure('Name', 'Simulation Result Viewer');
+            
+            % for some reason need to initialize simAx as an axes before
+            % indexing
+            obj.simAx = subplot(2, 2, 2);
+            obj.simAx(2) = subplot(2, 2, 3);
+            obj.simAx(3) = subplot(2, 2, 4);
+
+            xlabels = {'State', ['Time (' obj.timeUnits ')'], ['Delay Time (' obj.timeUnits ')']};
+            ylabels = {'State', 'Population', 'g^2(\tau)'};
+            titles = {'Generator Matrix', 'Populations', 'Autocorrelation'};
+            
+            
+            % setup the axes
+            for iAx = 1:length(obj.simAx)
+                obj.simAx(iAx).XLabel.String = xlabels{iAx};
+                obj.simAx(iAx).YLabel.String = ylabels{iAx};
+                obj.simAx(iAx).Box = 'on';
+                title(obj.simAx(iAx), titles{iAx})
+                hold(obj.simAx(iAx), 'on')
+                
+                if iAx > 1
+                    obj.simAx(iAx).XScale = 'log';
+                end
+            end
+            
+            % set up each invidual plot
+            obj.simAx(1).YDir = 'reverse';
+            obj.simGPlot = imagesc(obj.simAx(1), zeros(obj.nLevels, obj.nLevels));
+            for i = 1:obj.nLevels+1
+                plot(obj.simAx(1), [.5,obj.nLevels+0.5],[i-.5,i-.5],'k-');
+                plot(obj.simAx(1),[i-.5,i-.5],[.5,obj.nLevels+0.5],'k-');
+            end
+            obj.simAx(1).XLim = [0.5, obj.nLevels+0.5];
+            obj.simAx(1).YLim = [0.5, obj.nLevels+0.5];
+            
+            colormap(obj.simAx(1), 'parula');
+            cb = colorbar(obj.simAx(1), 'EastOutside');
+            cb.Label.String = obj.rateUnits;
+            
+            % populations
+            obj.simPopPlot = plot(obj.simAx(2), NaN);
+            legstr{1} = 'Level 1';
+            for i = 2:obj.nLevels
+                obj.simPopPlot(i) = plot(obj.simAx(2), NaN);
+                legstr{i} = ['Level ' num2str(i)];
+            end
+            legend(obj.simAx(2), legstr)
+
+            % autocorrelation
+            obj.simAutoCorrPlot = plot(obj.simAx(3), NaN, 'ko','MarkerFaceColor','red');
+            xticks(obj.simAx(3), [1 100])
+            if obj.nSimulations > 1
+                % text around the slider
+                obj.simNumText = uicontrol(simFig, 'Style', 'text',...
+                    'Position', [80,370,120,20],...
+                    'String', ['Simulation #' num2str(obj.currentSim)]);
+                               
+                uicontrol(simFig, 'Style', 'text',...
+                    'Position', [50,340,40,20],...
+                    'String', '1')
+
+                uicontrol(simFig, 'Style', 'text',...
+                    'Position', [198,340,40,20],...
+                    'String', num2str(obj.nSimulations))
+                
+                 
+                 % text with simulation parameters
+                 obj.simParamText = uicontrol(simFig, 'Style', 'text',...
+                     'HorizontalAlignment','left', ...
+                     'Position', [80, 250, 120, 75],...
+                     'String', ['xSat = ' num2str(obj.currentSim) newline ...
+                     'B-field Amplitude = ' num2str(norm([obj.simParams(obj.currentSim).Bvec])) newline...
+                     'B-field Angle = ' num2str(asind([obj.simParams(obj.currentSim).Bvec]/norm([obj.simParams(obj.currentSim).Bvec]))) char(176)]);
+
+                
+                % add the slider
+                c = uicontrol(simFig,'Style','slider');
+                c.Value = 1;
+                c.Min = 1;
+                c.Max = obj.nSimulations;
+                c.SliderStep = [1/(c.Max-1), 1/(c.Max-1)];
+                c.Position = [80,343,120,20];           
+                c.Callback = @(src, event)obj.update_simulation_figure(src, event);
+                
+                % store in the class property
+                obj.simSlider = c;
+            end
+        end
+        
+        function obj = update_simulation_figure(obj, src, ~)
+            % update the simulation figure given the supplied index
+            
+            obj.currentSim = round(src.Value);
+            
+            obj.simNumText.String = ['Simulation #' num2str(obj.currentSim)];
+             
+            % define sweep var if not passed
+            if isempty(obj.simParams(obj.currentSim).Bvec)
+               obj.simParams(obj.currentSim).Bvec = [0 0 0];
+               angle = 'NA';
+            else
+                angle = num2str(asind([obj.simParams(obj.currentSim).Bvec(1)]/norm([obj.simParams(obj.currentSim).Bvec])));
+            end
+            
+            obj.simParamText.String = ['xSat = ' num2str(obj.simParams(obj.currentSim).xSat) newline ...
+                     'B-field Amplitude = ' num2str(norm(obj.simParams(obj.currentSim).Bvec)) newline...
+                     'B-field Angle = ' angle char(176)];
+            
+            % plot the generator matrix
+            obj.simGPlot.CData = obj.simParams(obj.currentSim).G;
+            
+            % plot the populations
+            for i = 1:obj.nLevels
+                obj.simPopPlot(i).XData = obj.simResults(obj.currentSim).t*obj.timeScale;
+                obj.simPopPlot(i).YData = obj.simResults(obj.currentSim).p(:, i);
+
+            end
+            xticks(obj.simAx(2),logspace(ceil(log10(min(obj.simPopPlot(1).XData(2)))), ceil(log10(max(obj.simPopPlot(2).XData)))-1,ceil(log10(max(obj.simPopPlot(2).XData)))-ceil(log10(min(obj.simPopPlot(1).XData(2))))))
+            
+            % plot the autocorrelation
+            obj.simAutoCorrPlot.XData = obj.simResults(obj.currentSim).t*obj.timeScale;
+            obj.simAutoCorrPlot.YData = obj.simResults(obj.currentSim).g2;
+            xticks(obj.simAx(3),logspace(ceil(log10(obj.simAutoCorrPlot.XData(2))), ceil(log10(max(obj.simAutoCorrPlot.XData)))-1,ceil(log10(max(obj.simAutoCorrPlot.XData)))-ceil(log10(obj.simAutoCorrPlot.XData(2)))))
+
+        end
+        
+        function obj = plot_metadata(obj)
+            % plot the various calculated properties across the simulations
+            
+            % define sweep var if not passed
+            if isempty(obj.sweepVar)
+               obj.sweepVar = 1:obj.nSimulations; 
+               obj.sweepName = 'Simulation Index (undefined)';
+            else
+                 if obj.sweepFieldFlag
+                    sweepIdx = [1:length(obj.sweepVar)];
+                 elseif obj.sweepPowerFlag
+                    sweepIdx = (obj.nSimulations/length(obj.sweepVar))*[0:length(obj.sweepVar)-1]+1;
+                 else
+                    sweepIdx = [1:obj.nSimulations];
+                 end
+            end
+            
+            figHandle = figure('Name', 'Photon Statistics Metadata');
+            
+            
+            % setup two uipanels to group the different axes
+            leftPanel = uipanel(figHandle, 'Position', [0 0 0.5 1]);
+            rightPanel = uipanel(figHandle, 'Position', [0.5 0 0.5 1]);
+            
+            % plot PL rate vs. independent var
+            plAx = subplot(2, 1, 1, 'Parent', leftPanel);
+            plot(plAx, obj.sweepVar, [obj.simResults(sweepIdx).steadyStatePL], 'k-')
+            plAx.XLabel.String = obj.sweepName;
+            plAx.YLabel.String = ['PL Rate (' obj.rateUnits ')'];
+            
+            % plot the SS populations vs. independent var
+            % parse the data
+            ssPop = zeros(obj.nSimulations, obj.nLevels);
+            for iSim = 1:obj.nSimulations
+                ssPop(iSim, :) = obj.simResults(iSim).steadyStatePopulation;
+            end
+            
+            popAx = subplot(2, 1, 2, 'Parent', leftPanel);
+            plot(popAx, obj.sweepVar, ssPop(sweepIdx,:))
+            popAx.XLabel.String = obj.sweepName;
+            popAx.YLabel.String = 'Steady State Pop.';
+            
+            for i = 1:size(ssPop, 2)
+               legstr{i} = ['Level ' num2str(i)]; 
+            end
+            legend(popAx, legstr)
+                
+            
+            % sort the rates by complex vs. real
+            [imagRates, realRates] = obj.sort_complex_rates();
+            
+            % convert to positive values
+            imagRates = -1*imagRates;
+            realRates = -1*realRates;
+            
+            % plot all of the eigenvalues in a container (to handle the
+            % varying amount) Plot in descending order of magnitude
+            nImagPairs = size(imagRates, 1)/2;
+            nReal = size(realRates, 1);                      
+            nCols = nImagPairs + nReal;
+            
+            pltIdx = 1;
+            
+            % plot imaginary pairs at the top
+            for iVal = 1:nImagPairs
+                idx1 = 2*iVal-1;
+                idx2 = 2*iVal;
+                ax(pltIdx) = subplot(nCols, 1, pltIdx, 'Parent', rightPanel);
+                hold(ax(pltIdx), 'on')
+                ax(pltIdx).Box = 'on';
+                plt1 = plot(ax(pltIdx), obj.sweepVar, real(imagRates(idx1, sweepIdx)));
+                plot(ax(pltIdx), obj.sweepVar, imag(imagRates(idx1, sweepIdx)), 'LineStyle', '--', 'Color', plt1.Color)
+                
+                plt2 = plot(ax(pltIdx), obj.sweepVar, real(imagRates(idx2, sweepIdx)));
+                plot(ax(pltIdx), obj.sweepVar, imag(imagRates(idx2, sweepIdx)), 'LineStyle', '--', 'Color', plt2.Color)
+                
+                legstr = {['#' num2str(idx1) ' Real'], ['#' num2str(idx1) ' Imag'], ...
+                    ['#' num2str(idx2) ' Real'], ['#' num2str(idx2) ' Imag']};
+                legend(ax(pltIdx), legstr)
+                ylabel(['Imag. Pair #' num2str(iVal) '(' obj.rateUnits ')'])
+                % iterate subplot index
+                pltIdx = pltIdx + 1;
+                xlabel(obj.sweepName)
+            end
+            
+            % plot the remaining real values
+            for iVal = 1:nReal
+                ax(pltIdx) = subplot(nCols, 1, pltIdx, 'Parent', rightPanel);
+                hold(ax(pltIdx), 'on')
+                ax(pltIdx).Box = 'on';
+                plt = plot(ax(pltIdx), obj.sweepVar, realRates(iVal, sweepIdx));
+                pltIdx = pltIdx + 1;
+                
+                ylabel(['Real Rate #' num2str(iVal) '\newline (' obj.rateUnits ')'])
+                xlabel(obj.sweepName)
+            end
+            
+            
+        end
+        
+        function [imagRates, realRates] = sort_complex_rates(obj)
+           % helper function for finding complex and real rates.
+           
+           eigVals = [obj.simResults.eigRates];
+           
+           % sort the non-zero eigenvalues into conjugate pairs
+           conjPairs = cplxpair(eigVals(2:end, :));
+           
+           % iterate over the rates and group accordingly
+           nEigs = size(conjPairs, 1);
+           imagRates = [];
+           realRates = [];
+           iVal = 1;
+           nImag = 0;
+           nReal = 0;
+           while iVal <= nEigs
+              if any(imag(conjPairs(iVal, :)) ~= 0)
+                  % non-zero imaginary value found, thus it must have a
+                  % pair
+                  nImag = nImag+1;
+                  imagRates(nImag, :) = conjPairs(iVal, :);
+                  nImag = nImag+1;
+                  imagRates(nImag, :) = conjPairs(iVal+1, :);
+                  
+                  % iterate iVal above the last rate
+                  iVal = iVal+2;
+              else
+                  nReal = nReal+1;
+                  realRates(nReal, :) = real(conjPairs(iVal, :));
+                  iVal = iVal+1;
+              end
+              
+           end
+           
+        end
+        
+        
+        function add_non_idealities(obj, timeRange, noiseValue)
+            % add experimental non-idealities to the g2 curves
+            % range is a 2x1 vector with starting and stop value
+            % (corresponding to the timeScale units) to chop the data over
+            % noise value is a gaussian standard deviation to add to the
+            % first g2 point. It is then scaled down by the square root of
+            % time to mimic the observed data.
+            
+            
+                                          
+            % iterate over each simulation
+            for iSim = 1:obj.nSimulations
+                % find the indices to pull out the values over.
+                startIdx = find(obj.simResults(iSim).t*obj.timeScale >= timeRange(1), 1);
+                stopIdx = find(obj.simResults(iSim).t*obj.timeScale >= timeRange(2), 1);
+                
+                if isempty(stopIdx)
+                    stopIdx = length(obj.simResults(iSim).t);
+                end
+               
+               % get the values set
+               obj.noisySimResults(iSim).t = obj.simResults(iSim).t(startIdx:stopIdx);
+               
+               obj.noisySimResults(iSim).g2 = zeros(stopIdx - startIdx, 1);
+               
+               % add the noise
+               meanCounts = (1./noiseValue)^2;
+               meanCountsPerBin = meanCounts.*(obj.noisySimResults(iSim).t./obj.noisySimResults(iSim).t(1));
+               
+               % convert g2 to counts
+               g2Counts = meanCountsPerBin.*obj.simResults(iSim).g2(startIdx:stopIdx);
+               
+               % sample from the counts and re-normalize the
+               % autocorrelation function
+               sampledCounts = poissrnd(g2Counts);
+               obj.noisySimResults(iSim).g2 = sampledCounts./meanCountsPerBin;
+               
+               % assign errors baed on poisson statistics
+               obj.noisySimResults(iSim).g2Errs = 1./sqrt(meanCountsPerBin);
+            end
+                              
+        end
+    end
+end
+
