@@ -7,4 +7,4 @@ Repository contains an example of processing experimental time-tagged-time-resol
 
 `Photon Statistic Simulator/example.m` defines a 5-level toy model with spin dynamics and simulates the model's optical dynamics through `PhotonStatisticSim.m`.
 
-`time-tagged-time-resolved/crosscorrelation_analysis_script_example.m` analyzes example hBN time-tagged-time-resolved photon arrival data through the processing script, ` TTTR_cross_correlation.m`, including a demonstration of partitioning data between different blinking states.
+`time-tagged-time-resolved/crosscorrelation_partitions_example.m` analyzes example hBN time-tagged-time-resolved photon arrival data through the processing script, ` TTTR_cross_correlation.m`, including a demonstration of partitioning data between different blinking states.
